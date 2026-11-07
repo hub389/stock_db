@@ -79,29 +79,31 @@ write_file(f"{db}/feat.sdb", "feat", FTC, blocks,
                     "h30/l30=09:30前高低；ht/lt=當日最高/最低出現分鐘(541=09:01)；0=無值"})
 print("feat", round(time.time() - t0), "s")
 
-# 台指期
-z = zipfile.ZipFile(sys.argv[2]); tl = []
-for nm in sorted(z.namelist()):
-    if not nm.endswith(".csv"):
-        continue
-    df = pd.read_csv(io.BytesIO(z.read(nm)), dtype={"datetime": str})
-    tl.append(df)
-tx = pd.concat(tl, ignore_index=True)
-dt = tx["datetime"].str.split(" ", expand=True)
-tx["date"] = dt[0].str.replace("-", "").astype(int)
-hm = dt[1].str.split(":", expand=True).astype(int)
-tx["t"] = hm[0] * 60 + hm[1]
-n0 = len(tx)
-tx = tx.drop_duplicates(["date", "t"], keep="first")
-bad = {20240831, 20241031, 20251122, 20251206, 20260131}
-tx = tx[~tx.date.isin(bad)].sort_values(["date", "t"])
-data = {c["n"]: tx[c["n"]].values for c in TXC}
-raw, n, base = encode_block(TXC, data)
-d2 = decode_block(TXC, raw, n, base)
-assert all(np.array_equal(d2[c["n"]], tx[c["n"]].values) for c in TXC)
-write_file(f"{db}/txf.sdb", "txf", TXC, [{"k": "TXF", "raw": raw, "r": n, "b": base}],
-           {"note": "台指期日盤1分K 08:46~13:45；已去重複列、排除颱風停市等非交易日"})
-print("txf rows", n0, "->", n, "days", tx.date.nunique())
+if sys.argv[2] != "-":
+    # 台指期
+    z = zipfile.ZipFile(sys.argv[2]); tl = []
+    for nm in sorted(z.namelist()):
+        if not nm.endswith(".csv"):
+            continue
+        df = pd.read_csv(io.BytesIO(z.read(nm)), dtype={"datetime": str})
+        tl.append(df)
+    tx = pd.concat(tl, ignore_index=True)
+    dt = tx["datetime"].str.split(" ", expand=True)
+    tx["date"] = dt[0].str.replace("-", "").astype(int)
+    hm = dt[1].str.split(":", expand=True).astype(int)
+    tx["t"] = hm[0] * 60 + hm[1]
+    n0 = len(tx)
+    tx = tx.drop_duplicates(["date", "t"], keep="first")
+    bad = {20240831, 20241031, 20251122, 20251206, 20260131}
+    tx = tx[~tx.date.isin(bad)].sort_values(["date", "t"])
+    data = {c["n"]: tx[c["n"]].values for c in TXC}
+    raw, n, base = encode_block(TXC, data)
+    d2 = decode_block(TXC, raw, n, base)
+    assert all(np.array_equal(d2[c["n"]], tx[c["n"]].values) for c in TXC)
+    write_file(f"{db}/txf.sdb", "txf", TXC, [{"k": "TXF", "raw": raw, "r": n, "b": base}],
+               {"note": "台指期日盤1分K 08:46~13:45；已去重複列、排除颱風停市等非交易日"})
+    print("txf rows", n0, "->", n, "days", tx.date.nunique())
+
 
 # manifest
 old = json.load(open(f"{db}/manifest.json")) if os.path.exists(f"{db}/manifest.json") else {}

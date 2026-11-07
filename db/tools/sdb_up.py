@@ -12,8 +12,10 @@ DAY = "/sdcard/Download/day_data"   # 日K：day_data/<代號>/d1_<代號>.csv �
 REPO = os.path.expanduser("~/stock_db")
 OUT = os.path.expanduser("~/up")
 LOG = os.path.expanduser("~/.sdb_sent.json")
+PENDING = os.path.expanduser("~/.sdb_pending.json")
 MAN_URL = "https://raw.githubusercontent.com/hub389/stock_db/main/db/manifest.json"
 REPORT = "/sdcard/Download/sdb_檢查報告.txt"
+TICK_FROM = 20260102  # TICK 只收 2026 年起
 
 
 def load_manifest():
@@ -45,7 +47,92 @@ def day_file(code):
     return None
 
 
+def g(*a, env=None):
+    r = subprocess.run(["git", "-C", REPO, *a], capture_output=True, text=True, env=env)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip()[-600:])
+    return r.stdout.strip()
+
+
+def push_pending(t0):
+    """推送 ~/up 內待上傳的包；失敗可重跑，不必重新打包"""
+    pd_ = json.load(open(PENDING))
+    if not os.path.isdir(f"{REPO}/.git"):
+        subprocess.run(["git", "clone", "--depth", "1", "--filter=blob:none", "--no-checkout",
+                        "https://github.com/hub389/stock_db.git", REPO], check=True)
+    g("config", "http.postBuffer", "524288000")
+    for i in range(1, 4):
+        try:
+            g("fetch", "--depth", "1", "--filter=blob:none", "origin", "main")
+            env = dict(os.environ, GIT_INDEX_FILE=f"{REPO}/.git/sdb_index")
+            g("read-tree", "FETCH_HEAD", env=env)
+            for pp in pd_["parts"]:
+                h = g("hash-object", "-w", pp)
+                g("update-index", "--add", "--cacheinfo", f"100644,{h},inbox/{os.path.basename(pp)}", env=env)
+            tree = g("write-tree", env=env)
+            cm = g("commit-tree", tree, "-p", "FETCH_HEAD", "-m", f"inbox {pd_['name']}")
+            print(f"上傳中（第 {i} 次，{len(pd_['parts'])} 檔）…", flush=True)
+            r = subprocess.run(["git", "-C", REPO, "push", "--progress", "origin", f"{cm}:refs/heads/main"])
+            if r.returncode == 0:
+                break
+        except RuntimeError as e:
+            print("git 錯誤：", e)
+        if i == 3:
+            sys.exit("推送失敗 3 次（多半是網路中斷）。網路恢復後再執行一次即可，會直接續傳、不必重新打包。")
+        print("推送失敗，30 秒後自動重試…", flush=True)
+        time.sleep(30)
+    sent = json.load(open(LOG)) if os.path.exists(LOG) else {}
+    for k in pd_["keys"]:
+        sent[k] = 1
+    json.dump(sent, open(LOG, "w"))
+    for pp in pd_["parts"]:
+        if os.path.exists(pp):
+            os.remove(pp)
+    os.remove(PENDING)
+    print(f"推送完成：inbox/{pd_['name']}　共 {time.time()-t0:.0f} 秒")
+
+
+def recover_v11():
+    """V1.1 推送失敗留下的包：從包內清單重建待上傳記錄"""
+    if os.path.exists(PENDING) or not os.path.isdir(OUT):
+        return
+    names = sorted({f.split(".tar.gz")[0] for f in os.listdir(OUT) if f.startswith("inbox_") and ".tar.gz" in f})
+    if not names:
+        return
+    nm = names[-1]
+    parts = sorted(f"{OUT}/{f}" for f in os.listdir(OUT) if f.startswith(nm + ".tar.gz"))
+    print(f"發現上次未完成的包 {nm}（{len(parts)} 檔），讀取清單中（約 1~3 分鐘）…", flush=True)
+
+    class Cat:
+        def __init__(s, ps): s.ps, s.i, s.f = ps, 0, open(ps[0], "rb")
+        def read(s, n=-1):
+            out = b""
+            while n < 0 or len(out) < n:
+                b = s.f.read(-1 if n < 0 else n - len(out))
+                if b: out += b; continue
+                s.f.close(); s.i += 1
+                if s.i >= len(s.ps): break
+                s.f = open(s.ps[s.i], "rb")
+            return out
+    keys = []
+    with tarfile.open(fileobj=Cat(parts), mode="r|gz") as tf:
+        for m in tf:
+            p = m.name.split("/")
+            if p[0] == "sj_data" and len(p) == 3:
+                fn = p[2]; keys.append(f"{fn.split('_')[0]}/{p[1]}/{fn[-12:-4]}")
+            elif p[0] == "day_data":
+                pass  # 日K 列由日期判斷，重新比對即可
+    json.dump({"name": nm + ".tar.gz", "parts": parts, "keys": keys}, open(PENDING, "w"))
+    print(f"清單 {len(keys)} 檔，續傳…")
+
+
 def main():
+    t0 = time.time()
+    recover_v11()
+    if os.path.exists(PENDING):
+        push_pending(t0)
+        print("如還有新資料，再執行一次即可。")
+        return
     only_check = len(sys.argv) > 1 and sys.argv[1] == "check"
     t0 = time.time()
     man = load_manifest()
@@ -73,7 +160,7 @@ def main():
                 d = int(fn[-12:-4])
             except ValueError:
                 continue
-            if d == 20241201 or in_db(kind, c, d) or sent.get(f"{kind}/{c}/{d}"):
+            if d == 20241201 or (kind == "tick" and d < TICK_FROM) or in_db(kind, c, d) or sent.get(f"{kind}/{c}/{d}"):
                 continue
             new.append((kind, c, d, f"{d0}/{fn}"))
     # 新交易日：本次有 ≥100 檔 1分K 的日期
@@ -124,7 +211,35 @@ def main():
         grp.setdefault((d, key), []).append(c)
     for (d, key), cs in sorted(grp.items()):
         msg.append(f"{d} {key} {len(cs)} 檔：" + "、".join(cs[:15]) + ("…" if len(cs) > 15 else ""))
-    open(REPORT, "w").write("\n".join(msg[:3] + prob) + "\n")
+    # TICK 涵蓋檢查（2026 年起；庫內＋本次待上傳）
+    cov, full = [], 0
+    for d in cal + newdays:
+        if d < TICK_FROM:
+            continue
+        cs = [c for c in codes if c != "101" and (in_db("m1", c, d) or ("m1", c, d) in have)
+              and (c, d, "tick") not in gaps]
+        miss = [c for c in cs if not in_db("tick", c, d) and ("tick", c, d) not in have
+                and not sent.get(f"tick/{c}/{d}")]
+        if not miss:
+            full += 1
+        else:
+            cov.append((d, len(miss), len(cs), miss))
+    msg.append(f"TICK {TICK_FROM}起：完整 {full} 天，有缺 {len(cov)} 天")
+    i = 0
+    while i < len(cov):  # 相鄰日期缺同一批檔案者合併為一行
+        j = i
+        whole = lambda k: cov[k][1] == cov[k][2]
+        while j + 1 < len(cov) and ((whole(i) and whole(j + 1)) or
+                                    (not whole(i) and cov[j + 1][3] == cov[i][3])):
+            j += 1
+        d, m, n, miss = cov[i]
+        rng = f"{cov[i][0]}~{cov[j][0]}（{j-i+1}天）" if j > i else str(d)
+        if m == n:
+            msg.append(f"　{rng} 整天未下載")
+        else:
+            msg.append(f"　{rng} 缺 {m}/{n} 檔：" + "、".join(miss[:10]) + ("…" if m > 10 else ""))
+        i = j + 1
+    open(REPORT, "w").write("\n".join(msg[:3] + prob + msg[3 + len(grp):]) + "\n")
     print("\n".join(msg))
     print(f"報告：{REPORT}　檢查 {time.time()-t0:.0f} 秒")
     if only_check or (not new and not dnew):
@@ -155,28 +270,9 @@ def main():
                 pp = f"{pkg}.part{i:02d}"; open(pp, "wb").write(ch); parts.append(pp); i += 1
         os.remove(pkg)
     print(f"打包 {name}（{sz/1e6:.1f}MB，{len(parts)} 檔）")
-    # 推送：不下載舊大檔，只把新檔加到 inbox/
-    g = lambda *a, **kw: subprocess.run(["git", "-C", REPO, *a], check=True, capture_output=True, text=True, **kw).stdout.strip()
-    if not os.path.isdir(f"{REPO}/.git"):
-        subprocess.run(["git", "clone", "--depth", "1", "--filter=blob:none", "--no-checkout",
-                        "https://github.com/hub389/stock_db.git", REPO], check=True)
-    g("config", "http.postBuffer", "524288000")
-    g("fetch", "--depth", "1", "--filter=blob:none", "origin", "main")
-    env = dict(os.environ, GIT_INDEX_FILE=f"{REPO}/.git/sdb_index")
-    g("read-tree", "FETCH_HEAD", env=env)
-    for pp in parts:
-        h = g("hash-object", "-w", pp)
-        g("update-index", "--add", "--cacheinfo", f"100644,{h},inbox/{os.path.basename(pp)}", env=env)
-    tree = g("write-tree", env=env)
-    cm = g("commit-tree", tree, "-p", "FETCH_HEAD", "-m", f"inbox {name}")
-    g("push", "origin", f"{cm}:refs/heads/main")
-    for k, c, d, p in new:
-        sent[f"{k}/{c}/{d}"] = 1
-    for c, rows in dnew.items():
-        for r in rows:
-            sent[f"day/{c}/{r['date']}"] = 1
-    json.dump(sent, open(LOG, "w"))
-    print(f"推送完成：inbox/{name}　共 {time.time()-t0:.0f} 秒")
+    keys = [f"{k}/{c}/{d}" for k, c, d, p in new] + [f"day/{c}/{r['date']}" for c, rows in dnew.items() for r in rows]
+    json.dump({"name": name, "parts": parts, "keys": keys}, open(PENDING, "w"))
+    push_pending(t0)
 
 
 if __name__ == "__main__":

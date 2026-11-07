@@ -27,9 +27,10 @@ def open_pkg(p):
 
 def main():
     db, pkgs = sys.argv[1], sys.argv[2:]
-    tmp = tempfile.mkdtemp()
+    keep = len(pkgs) == 1 and os.path.isdir(pkgs[0])  # 已解開的目錄
+    tmp = pkgs[0] if keep else tempfile.mkdtemp()
     done = set()
-    for p in pkgs:
+    for p in ([] if keep else pkgs):
         key = p.split(".part")[0]
         if key in done:
             continue
@@ -115,7 +116,8 @@ def main():
             raw, n, base = encode_block(DYC, data); check(DYC, raw, n, base, data)
             out[code] = {"k": code, "raw": raw, "r": n, "b": base}
         write_file(f"{db}/daily.sdb", "daily", DYC, [out[k] for k in sorted(out)])
-    shutil.rmtree(tmp)
+    if not keep:
+        shutil.rmtree(tmp)
     print("合併完成：1分K", sum(len(v) for v in newm.values()), "區塊，TICK",
           sum(len(v) for v in newt.values()), "區塊", "；異常", errs if errs else "無")
 
